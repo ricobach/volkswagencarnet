@@ -1,0 +1,12 @@
+services:
+  vw-sandbox:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+    env_file:
+      - .env
+    volumes:
+      # Mount the checkout so edits to volkswagencarnet/ are used immediately.
+      # No Python packages are installed on the Docker host.
+      - ..:/workspace
+    working_dir: /workspace
