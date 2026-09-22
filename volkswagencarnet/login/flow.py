@@ -1,61 +1,59 @@
-"""VW device-flow login orchestrator."""
+"""Volkswagen EU OIDC/PKCE login flow.
+
+Volkswagen EU does not allow the consumer VW client to use RFC 8628
+device_authorization.  This flow therefore uses the normal OIDC authorize
+endpoint with PKCE and the existing Auth0/IDK username/password form.
+
+The hybrid response_type is intentional: current VW EU deployments can return
+usable access/id tokens in the app callback even when the CARIAD token exchange
+is restricted.  When an authorization code is available we still attempt the
+current CARIAD token exchange with x-qmauth in order to obtain a refresh token.
+"""
 
 from __future__ import annotations
 
-import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
+import os
 import time
-from dataclasses import dataclass
+import uuid
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import aiohttp
-from aiohttp import client_exceptions
+from bs4 import BeautifulSoup
 from yarl import URL
 
-from ..vw_const import (
-    CLIENT_SCOPE,
-    DEVICE_FLOW_AUTHORIZATION_URL,
-    DEVICE_FLOW_BROWSER_HEADERS,
-    DEVICE_FLOW_BROWSER_HEADERS_FIREFOX,
-    DEVICE_FLOW_CLIENT_ID,
-    DEVICE_FLOW_CODE_CONFIRMATION_URL,
-    DEVICE_FLOW_LOGIN_AUTHENTICATE_URL,
-    DEVICE_FLOW_LOGIN_IDENTIFIER_URL,
-    DEVICE_FLOW_TOKEN_URL,
-)
-from ..vw_exceptions import (
-    LoginCredentialsError,
-    LoginError,
-    LoginFlowChangedError,
-    LoginPageParseError,
-)
-from ..vw_utilities import dump_html_debug, safe_int
-from ._idkit import (
-    _IdKitError,
-    IdKitInfo,
-    IdKitPageObject,
-    IdKitPageObjectExtractor,
-    IdKitStage,
-)
-from ._verification import LoginVerifier
+from ..vw_const import APP_URI, CLIENT_ID, CLIENT_SCOPE
+from ..vw_exceptions import LoginCredentialsError, LoginError
+from ..vw_utilities import dump_html_debug
 
 _LOGGER = logging.getLogger(__name__)
 
-FULL_ROUTE = [
-    IdKitStage.IDENTIFIER,
-    IdKitStage.PASSWORD,
-    IdKitStage.CONFIRM,
-    IdKitStage.SUCCESS,
-]
-QUICK_ROUTE = [IdKitStage.CONFIRM, IdKitStage.SUCCESS]
+_IDK_BASE = "https://identity.vwgroup.io"
+_AUTHORIZE_URL = f"{_IDK_BASE}/oidc/v1/authorize"
+_CARIAD_TOKEN_URL = "https://emea.bff.cariad.digital/auth/v1/idk/oidc/token"
 
-_TRANSIENT_POLL_STATUSES = {429, 500, 502, 503, 504}
-_TRANSIENT_POLL_ERRORS = {"temporarily_unavailable", "server_error"}
+# Current VW Android identity.  Keep this local to the auth flow so changing the
+# general API user-agent is not required to test authentication.
+_VW_USER_AGENT = "Volkswagen/4.2.1-android/14"
+_FIREFOX_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) "
+    "Gecko/20100101 Firefox/130.0"
+)
 
-# Known VW identity error codes returned as error= in the redirect URL.
-_VW_AUTH_ERROR_MESSAGES: dict[str, str] = {
+# x-qmauth values currently used by the VW/Audi CARIAD token endpoint.
+# The previous pair is retained as a single retry because these values have
+# rotated before.
+_QM_CLIENT_ID = "01da27b0"
+_QM_SECRET = "1ab69925ac179aaa4e83abe671a9476d176418b85bd706f1436ca15be647989c"
+_QM_PRIOR_CLIENT_ID = "c95f4fd2"
+_QM_PRIOR_SECRET = "e47866378ef0658ce75d71007a809f34616b9635e2ec228245784c1f63e88d06"
+
+_AUTH_ERROR_MESSAGES = {
     "login.errors.password_invalid": "Incorrect password.",
     "login.error.throttled": "Too many failed login attempts — please wait before trying again.",
     "login.error.locked": "Account has been locked due to too many failed attempts.",
@@ -63,31 +61,75 @@ _VW_AUTH_ERROR_MESSAGES: dict[str, str] = {
 }
 
 
-@dataclass(frozen=True)
-class LoginRequest:
-    """Request payload for a single login stage."""
+def _require_str(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise LoginError(f"Missing or invalid {field}")
+    return value
 
-    stage: IdKitStage
-    url: str
-    payload: dict[str, str]
+
+def _pkce_pair() -> tuple[str, str]:
+    verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode("ascii")
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _x_qmauth(client_id: str, secret_hex: str) -> str:
+    bucket = int(time.time() / 100)
+    signature = hmac.new(
+        bytes.fromhex(secret_hex),
+        str(bucket).encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"v1:{client_id}:{signature}"
+
+
+def _callback_params(url: str) -> dict[str, str]:
+    parsed = urlparse(url)
+    result: dict[str, str] = {}
+    for source in (parsed.query, parsed.path.lstrip("?"), parsed.fragment):
+        if not source:
+            continue
+        for key, values in parse_qs(source).items():
+            if values and key not in result:
+                result[key] = values[0]
+    return result
+
+
+def _safe_url(url: str) -> str:
+    """Return host + path only; never log callback query/fragment tokens."""
+    parsed = urlparse(url)
+    return f"{parsed.netloc}{parsed.path}"
 
 
 class VWLoginFlow:
-    """Route-driven VW device-flow login."""
+    """VW EU PKCE/hybrid authentication."""
 
     def __init__(
         self,
-        verifier: LoginVerifier | None = None,
+        verifier=None,  # retained for API compatibility with the previous flow
         html_debug_dir: Path | None = None,
         use_fake_user_agent: bool = False,
-        client_id: str = DEVICE_FLOW_CLIENT_ID,
+        client_id: str = CLIENT_ID,
         client_scope: str = CLIENT_SCOPE,
     ) -> None:
-        self._verifier = verifier or LoginVerifier()
+        del verifier
         self._html_debug_dir = html_debug_dir
         self._use_fake_user_agent = use_fake_user_agent
         self._client_id = _require_str(client_id, "client_id")
         self._client_scope = _require_str(client_scope, "client_scope")
+
+    def _browser_headers(self) -> dict[str, str]:
+        return {
+            "User-Agent": (
+                _FIREFOX_USER_AGENT if self._use_fake_user_agent else _VW_USER_AGENT
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.5",
+        }
 
     async def login(
         self,
@@ -96,458 +138,370 @@ class VWLoginFlow:
         *,
         cookies_file: Path | None = None,
     ) -> dict:
-        _require_str(username, "username")
-        _require_str(password, "password")
+        username = _require_str(username, "username")
+        password = _require_str(password, "password")
 
-        async with aiohttp.ClientSession(headers=self._browser_headers()) as session:
-            device = await self._start_device_flow(session)
-            device_code = _require_str(device.get("device_code"), "device_code")
-            verification_uri = (
-                device.get("verification_uri_complete")
-                or device.get("verification_uri")
-                or ""
-            )
-            if not verification_uri:
-                raise LoginError("Device flow response missing verification URI")
-
-            interval = safe_int(device.get("interval", 5), 5)
-            expires_in = safe_int(device.get("expires_in", 330), 330)
-            max_wait = max(330, max(expires_in - 5, 30))
-
-            try:
-                await self._run_browser_route(
-                    verification_uri=verification_uri,
-                    username=username,
-                    password=password,
-                    cookies_file=cookies_file,
-                )
-            except (LoginFlowChangedError, LoginPageParseError):
-                raise
-            except _IdKitError as error:
-                raise LoginPageParseError(str(error)) from error
-
-            return await self._poll_token(
-                session=session,
-                device_code=device_code,
-                interval=interval,
-                max_wait_seconds=max_wait,
-            )
-
-    async def _start_device_flow(self, session: aiohttp.ClientSession) -> dict:
-        _LOGGER.debug("POST %s", DEVICE_FLOW_AUTHORIZATION_URL)
-        async with session.post(
-            DEVICE_FLOW_AUTHORIZATION_URL,
-            data={"client_id": self._client_id, "scope": self._client_scope},
-        ) as response:
-            _LOGGER.debug("device_authorization response: HTTP %s", response.status)
-            response.raise_for_status()
-            return await response.json(content_type=None)
-
-    async def _run_browser_route(
-        self,
-        verification_uri: str,
-        username: str,
-        password: str,
-        cookies_file: Path | None,
-    ) -> None:
         jar = aiohttp.CookieJar(unsafe=True)
         if cookies_file is not None:
-            await _load_cookies(jar, cookies_file, "identity.vwgroup.io")
-        current_url = ""
-        html = ""
+            await _load_cookies(jar, cookies_file)
+
+        verifier, challenge = _pkce_pair()
 
         async with aiohttp.ClientSession(
             headers=self._browser_headers(),
             cookie_jar=jar,
-        ) as browser:
-            try:
-                _LOGGER.debug("GET %s", verification_uri)
-                async with browser.get(
-                    verification_uri, allow_redirects=True
-                ) as response:
-                    current_url = str(response.url)
-                    html = await response.text()
-                _LOGGER.debug(
-                    "initial landing: HTTP %s url=%s", response.status, current_url
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as session:
+            callback_url = await self._authorize_and_login(
+                session,
+                username=username,
+                password=password,
+                code_challenge=challenge,
+            )
+            params = _callback_params(callback_url)
+
+            error = params.get("error")
+            if error:
+                raise LoginCredentialsError(
+                    _AUTH_ERROR_MESSAGES.get(
+                        error, f"Authentication rejected by VW: {error!r}"
+                    )
                 )
 
-                try:
-                    idk_obj = IdKitPageObjectExtractor.from_html(html)
-                except _IdKitError as error:
-                    self._raise_page_parse_error(
-                        "initial_landing", current_url, html, error
-                    )
+            auth_code = params.get("code")
+            callback_access = params.get("access_token")
+            callback_id = params.get("id_token")
 
-                try:
-                    initial_stage = idk_obj.stage
-                except _IdKitError as error:
-                    self._raise_initial_parse_error(current_url, html, error)
-
-                route = self._pick_route(initial_stage, current_url, html)
-                _LOGGER.debug(
-                    "initial stage=%s route=%s",
-                    initial_stage.value,
-                    [s.value for s in route],
+            if not auth_code and not (callback_access and callback_id):
+                raise LoginError(
+                    "VW callback contained neither an authorization code nor "
+                    "hybrid access/id tokens"
                 )
-                idk_info = IdKitInfo()
 
-                for index, expected_stage in enumerate(route[:-1]):
-                    try:
-                        current_stage = idk_obj.stage
-                    except _IdKitError as error:
-                        self._raise_initial_parse_error(current_url, html, error)
+            token_payload: dict | None = None
+            if auth_code:
+                token_payload = await self._exchange_code(
+                    session,
+                    auth_code=auth_code,
+                    code_verifier=verifier,
+                )
 
-                    if current_stage != expected_stage:
-                        self._raise_flow_changed(
-                            "unexpected_current_stage",
-                            current_url,
-                            html,
-                            f"expected {expected_stage.value!r}, got {current_stage.value!r}",
-                        )
+            # Prefer the exchange response because it may contain a refresh_token.
+            # If VW blocks that exchange but the hybrid callback supplied usable
+            # tokens, keep those rather than failing the entire login.
+            result: dict | None = None
+            if token_payload and token_payload.get("access_token"):
+                if not token_payload.get("id_token") and callback_id:
+                    token_payload["id_token"] = callback_id
+                if token_payload.get("id_token"):
+                    result = token_payload
 
-                    self._verifier.verify_idk_obj(
-                        stage=expected_stage,
-                        html=html,
-                        idk_obj=idk_obj,
-                        idk_info=idk_info,
-                        configured_client_id=self._client_id,
-                        expected_username=username,
-                    )
-
-                    self._update_idk_info(idk_info, idk_obj, expected_stage)
-                    request = self._build_request(
-                        expected_stage, idk_info, username, password
-                    )
-
-                    self._verifier.verify_request_matches_form(
-                        stage=expected_stage,
-                        current_url=current_url,
-                        html=html,
-                        planned_url=request.url,
-                        planned_payload=request.payload,
-                    )
-
-                    _LOGGER.debug(
-                        "POST %s (stage=%s)", request.url, expected_stage.value
-                    )
-                    async with browser.post(
-                        request.url,
-                        data=request.payload,
-                        allow_redirects=True,
-                    ) as response:
-                        current_url = str(response.url)
-                        html = await response.text()
-                        status = response.status
-                    _LOGGER.debug("POST response: HTTP %s url=%s", status, current_url)
-
-                    if status >= 400:
-                        raise LoginError(
-                            f"HTTP {status} while handling {expected_stage.value}"
-                        )
-
-                    if expected_stage == IdKitStage.CONFIRM:
-                        self._check_final_url(current_url)
-
-                    self._check_url_for_credentials_error(current_url)
-
-                    try:
-                        idk_obj = IdKitPageObjectExtractor.from_html(html)
-                    except _IdKitError as error:
-                        self._raise_page_parse_error(
-                            f"after_{expected_stage.value}", current_url, html, error
-                        )
-
-                    expected_next = route[index + 1]
-                    try:
-                        next_stage = idk_obj.stage
-                    except _IdKitError as error:
-                        self._raise_initial_parse_error(current_url, html, error)
-
-                    if next_stage != expected_next:
-                        self._raise_flow_changed(
-                            "unexpected_next_stage",
-                            current_url,
-                            html,
-                            f"after {expected_stage.value!r}: expected {expected_next.value!r}, "
-                            f"got {next_stage.value!r}",
-                        )
-
-                if cookies_file is not None:
-                    await _save_cookies(jar, cookies_file)
-
-            except (LoginFlowChangedError, LoginPageParseError, LoginError) as error:
-                await self._dump_and_reraise(error, current_url, html)
-
-    def _build_request(
-        self,
-        stage: IdKitStage,
-        idk_info: IdKitInfo,
-        username: str,
-        password: str,
-    ) -> LoginRequest:
-        if stage == IdKitStage.IDENTIFIER:
-            client_id = idk_info.client_id or self._client_id
-            return LoginRequest(
-                stage=stage,
-                url=DEVICE_FLOW_LOGIN_IDENTIFIER_URL.format(client_id=client_id),
-                payload={
-                    "_csrf": idk_info.get_csrf_token(),
-                    "relayState": idk_info.get_relay_state(),
-                    "hmac": idk_info.get_hmac(),
-                    "email": username,
-                },
-            )
-
-        if stage == IdKitStage.PASSWORD:
-            return LoginRequest(
-                stage=stage,
-                url=DEVICE_FLOW_LOGIN_AUTHENTICATE_URL.format(
-                    client_id=idk_info.get_client_id()
-                ),
-                payload={
-                    "_csrf": idk_info.get_csrf_token(),
-                    "relayState": idk_info.get_relay_state(),
-                    "hmac": idk_info.get_hmac(),
-                    "email": username,
-                    "password": password,
-                },
-            )
-
-        if stage == IdKitStage.CONFIRM:
-            query = urlencode(
-                {
-                    "relayState": idk_info.get_relay_state(),
-                    "user_id": idk_info.get_user_id(),
-                    "hmac": idk_info.get_hmac(),
+            if result is None and callback_access and callback_id:
+                _LOGGER.info(
+                    "Using OIDC hybrid callback tokens; no refresh token is available"
+                )
+                result = {
+                    "access_token": callback_access,
+                    "id_token": callback_id,
+                    "token_type": "Bearer",
                 }
-            )
-            return LoginRequest(
-                stage=stage,
-                url=(
-                    DEVICE_FLOW_CODE_CONFIRMATION_URL.format(
-                        client_id=idk_info.get_client_id(),
-                        user_code=idk_info.get_user_code(),
-                    )
-                    + "?"
-                    + query
-                ),
-                payload={
-                    "_csrf": idk_info.get_csrf_token(),
-                    "client_identity_name": idk_info.get_client_identity_name(),
-                    "allow": "",
-                },
-            )
 
-        raise LoginFlowChangedError(stage=stage.value)
+            if result is None:
+                raise LoginError(
+                    "Authorization succeeded, but no usable VW access/id token pair "
+                    "was returned"
+                )
 
-    def _update_idk_info(
-        self,
-        idk_info: IdKitInfo,
-        idk_obj: IdKitPageObject,
-        stage: IdKitStage,
-    ) -> None:
-        idk_info.stage = stage
-        idk_info.csrf_token = _require_str(idk_obj.csrf_token, "csrf_token")
+            if cookies_file is not None:
+                await _save_cookies(jar, cookies_file)
 
-        if stage == IdKitStage.IDENTIFIER:
-            idk_info.set_client_id(idk_obj.client_id)
-            idk_info.set_relay_state(idk_obj.relay_state)
-            idk_info.set_hmac(idk_obj.hmac)
-        elif stage == IdKitStage.PASSWORD:
-            idk_info.set_relay_state(idk_obj.relay_state)
-            idk_info.set_hmac(idk_obj.hmac)
-        elif stage == IdKitStage.CONFIRM:
-            idk_info.set_client_id(idk_obj.client_id)
-            idk_info.set_relay_state(idk_obj.relay_state)
-            idk_info.set_hmac(idk_obj.hmac)
-            idk_info.set_user_code(idk_obj.user_code)
-            idk_info.set_user_id(idk_obj.user_id)
-            idk_info.set_client_identity_name(idk_obj.client_identity_name)
-        elif stage not in (IdKitStage.PASSWORD, IdKitStage.SUCCESS):
-            raise LoginFlowChangedError(stage=stage.value)
+            return result
 
-    def _pick_route(
-        self,
-        initial_stage: IdKitStage,
-        current_url: str,
-        html: str,
-    ) -> list[IdKitStage]:
-        if initial_stage == IdKitStage.IDENTIFIER:
-            return FULL_ROUTE
-        elif initial_stage == IdKitStage.CONFIRM:
-            return QUICK_ROUTE
-        else:
-            self._raise_flow_changed(
-                "unexpected_initial_stage",
-                current_url,
-                html,
-                f"expected identifier or confirm, got {initial_stage.value!r}",
-            )
-
-    async def _poll_token(
+    async def _authorize_and_login(
         self,
         session: aiohttp.ClientSession,
-        device_code: str,
-        interval: int,
-        max_wait_seconds: int,
-    ) -> dict:
-        deadline = time.monotonic() + max_wait_seconds
-        poll_interval = max(interval, 1)
+        *,
+        username: str,
+        password: str,
+        code_challenge: str,
+    ) -> str:
+        scope = self._client_scope
+        if "offline_access" not in scope.split():
+            scope = f"{scope} offline_access"
 
-        while time.monotonic() < deadline:
-            await asyncio.sleep(poll_interval)
-            _LOGGER.debug(
-                "POST %s (polling, interval=%ss)", DEVICE_FLOW_TOKEN_URL, poll_interval
-            )
-            async with session.post(
-                DEVICE_FLOW_TOKEN_URL,
-                data={
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                    "device_code": device_code,
-                    "client_id": self._client_id,
-                },
-            ) as response:
-                if response.status == 200:
-                    return await response.json(content_type=None)
+        params = {
+            "client_id": self._client_id,
+            "redirect_uri": APP_URI,
+            "response_type": "code id_token token",
+            "scope": scope,
+            "nonce": uuid.uuid4().hex,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
 
-                if response.status in _TRANSIENT_POLL_STATUSES:
-                    _LOGGER.debug("Transient token poll HTTP %s", response.status)
+        _LOGGER.debug("GET %s (PKCE hybrid authorize)", _AUTHORIZE_URL)
+        async with session.get(
+            _AUTHORIZE_URL,
+            params=params,
+            allow_redirects=False,
+        ) as response:
+            first_location = response.headers.get("Location")
+            if not first_location:
+                body = await response.text()
+                await self._maybe_dump("authorize_no_redirect", body, str(response.url))
+                raise LoginError(
+                    f"VW authorize returned HTTP {response.status} without Location"
+                )
+            current = urljoin(str(response.url), first_location)
+
+        # Follow redirect(s) until the login HTML is reached.  Do not let aiohttp
+        # follow the final custom weconnect:// URI.
+        login_html = ""
+        login_url = current
+        for _ in range(10):
+            if login_url.startswith(APP_URI):
+                raise LoginError("VW redirected to app callback before credentials")
+            _LOGGER.debug("GET %s", _safe_url(login_url))
+            async with session.get(login_url, allow_redirects=False) as response:
+                location = response.headers.get("Location")
+                if location:
+                    login_url = urljoin(str(response.url), location)
+                    continue
+                login_html = await response.text()
+                if response.status != 200:
+                    await self._maybe_dump(
+                        "login_page_http_error", login_html, str(response.url)
+                    )
+                    raise LoginError(
+                        f"VW login page returned HTTP {response.status}"
+                    )
+                break
+        else:
+            raise LoginError("Too many redirects before VW login page")
+
+        state = _extract_state(login_html)
+        if not state:
+            await self._maybe_dump("login_page_no_state", login_html, login_url)
+            raise LoginError("VW login page did not contain an Auth0 state token")
+
+        login_post_url = f"{_IDK_BASE}/u/login?state={state}"
+        login_headers = self._browser_headers()
+        login_headers.update(
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": _IDK_BASE,
+                "Referer": login_url,
+            }
+        )
+        form = {
+            "username": username,
+            "password": password,
+            "state": state,
+            # Current VW hybrid flow requires the default action.  Without it,
+            # some IDK templates return to identifier-first instead of checking
+            # the password.
+            "action": "default",
+        }
+
+        _LOGGER.debug("POST %s", _safe_url(login_post_url))
+        async with session.post(
+            login_post_url,
+            headers=login_headers,
+            data=form,
+            allow_redirects=False,
+        ) as response:
+            location = response.headers.get("Location")
+            if not location:
+                body = await response.text()
+                await self._maybe_dump("login_post_no_redirect", body, str(response.url))
+                _raise_login_page_error(body, response.status)
+            current = urljoin(str(response.url), location)
+
+        # Follow the callback chain until the app URI.  Never log query strings
+        # or fragments because they contain authorization material.
+        for _ in range(15):
+            error = _callback_params(current).get("error")
+            if error:
+                raise LoginCredentialsError(
+                    _AUTH_ERROR_MESSAGES.get(
+                        error, f"Authentication rejected by VW: {error!r}"
+                    )
+                )
+
+            if current.startswith(APP_URI):
+                _LOGGER.debug("Reached VW app callback")
+                return current
+
+            _LOGGER.debug("GET redirect %s", _safe_url(current))
+            async with session.get(current, allow_redirects=False) as response:
+                location = response.headers.get("Location")
+                if location:
+                    current = urljoin(str(response.url), location)
                     continue
 
-                try:
-                    body = await response.json(content_type=None)
-                except (
-                    client_exceptions.ContentTypeError,
-                    json.JSONDecodeError,
-                    ValueError,
-                ):
-                    body = {}
+                body = await response.text()
+                if _looks_like_terms_page(body):
+                    await self._maybe_dump(
+                        "terms_required", body, str(response.url)
+                    )
+                    raise LoginError(
+                        "Volkswagen terms/consent must be accepted in the VW portal/app"
+                    )
+                await self._maybe_dump(
+                    "redirect_chain_stopped", body, str(response.url)
+                )
+                raise LoginError(
+                    f"VW login redirect chain stopped at HTTP {response.status}"
+                )
 
-                error_code = body.get("error", "")
+        raise LoginError("Too many redirects during VW login")
 
-            if error_code == "authorization_pending":
-                continue
-            if error_code == "slow_down":
-                poll_interval += 5
-                continue
-            if error_code in _TRANSIENT_POLL_ERRORS:
-                _LOGGER.debug("Transient token poll OAuth error=%s", error_code)
-                continue
-
-            raise LoginError(f"Token polling failed with OAuth error: {error_code!r}")
-
-        raise LoginError("Token polling timed out")
-
-    # --- error helpers ---
-
-    def _raise_initial_parse_error(
-        self, current_url: str, html: str, error: _IdKitError
-    ) -> None:
-        # registerCredentials means the email is not a VW account.
-        if "registerCredentials" in str(error):
-            raise LoginCredentialsError("Email address not found in VW account system")
-        self._raise_page_parse_error("initial_landing", current_url, html, error)
-
-    def _check_url_for_credentials_error(self, url: str) -> None:
-        error_val = parse_qs(urlparse(url).query).get("error", [None])[0]
-        if not error_val:
-            return
-        message = (
-            _VW_AUTH_ERROR_MESSAGES.get(error_val)
-            or f"Authentication rejected by VW: {error_val!r}"
-        )
-        raise LoginCredentialsError(message)
-
-    def _raise_flow_changed(
-        self, stage: str, current_url: str, html: str, reason: str
-    ) -> None:
-        _LOGGER.error(
-            "Login flow changed (stage=%s, url=%s): %s", stage, current_url, reason
-        )
-        raise LoginFlowChangedError(stage=stage)
-
-    def _raise_page_parse_error(
-        self, stage: str, current_url: str, html: str, error: _IdKitError
-    ) -> None:
-        _LOGGER.error(
-            "IDKit parse failed (stage=%s, url=%s): %s", stage, current_url, error
-        )
-        raise LoginPageParseError(
-            f"IDKit parse failed at {stage} (url={current_url}): {error}"
-        ) from error
-
-    def _check_final_url(self, url: str) -> None:
-        error_val = parse_qs(urlparse(url).query).get("error", [None])[0]
-        if error_val:
-            raise LoginError(f"Code confirmation returned error={error_val!r}")
-
-    async def _dump_and_reraise(
-        self, error: Exception, current_url: str, html: str
-    ) -> None:
-        if not current_url or not html or self._html_debug_dir is None:
-            raise error
-        if not _LOGGER.isEnabledFor(logging.DEBUG):
-            raise error
-
-        if isinstance(error, LoginFlowChangedError):
-            dump_stage = f"flow_changed_{error.stage}"
-        elif isinstance(error, LoginPageParseError):
-            dump_stage = "page_parse_error"
-        else:
-            dump_stage = "login_error"
-
-        dump_path = dump_html_debug(
-            dump_stage, html, self._html_debug_dir, url=current_url
-        )
-        dump_path_str = str(dump_path) if dump_path else None
-
-        if isinstance(error, LoginFlowChangedError):
-            raise LoginFlowChangedError(
-                stage=error.stage, dump_path=dump_path_str
-            ) from error
-        raise type(error)(f"{error} (dump={dump_path_str})") from error
-
-    def _browser_headers(self) -> dict[str, str]:
-        if self._use_fake_user_agent:
-            return DEVICE_FLOW_BROWSER_HEADERS_FIREFOX.copy()
-        return DEVICE_FLOW_BROWSER_HEADERS.copy()
-
-
-def _require_str(value: str | None, field_name: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise LoginError(f"Missing or invalid {field_name}")
-    return value
-
-
-async def _save_cookies(jar: aiohttp.CookieJar, path: Path) -> None:
-    data = [
-        {
-            "name": morsel.key,
-            "value": morsel.value,
-            "domain": morsel.get("domain", ""),
-            "path": morsel.get("path", "/"),
+    async def _exchange_code(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        auth_code: str,
+        code_verifier: str,
+    ) -> dict | None:
+        payload = {
+            "client_id": self._client_id,
+            "grant_type": "authorization_code",
+            "code": auth_code,
+            "redirect_uri": APP_URI,
+            "code_verifier": code_verifier,
         }
-        for morsel in jar
-    ]
-    await asyncio.to_thread(
-        path.write_text, json.dumps(data, indent=2), encoding="utf-8"
-    )
 
-
-async def _load_cookies(
-    jar: aiohttp.CookieJar, path: Path, default_domain: str
-) -> None:
-    if not await asyncio.to_thread(path.exists):
-        return
-    text = await asyncio.to_thread(path.read_text, encoding="utf-8")
-    for cookie in json.loads(text):
-        name = cookie.get("name")
-        value = cookie.get("value")
-        if not name or value is None:
-            continue
-        domain = cookie.get("domain") or default_domain
-        cookie_path = cookie.get("path") or "/"
-        jar.update_cookies(
-            {name: value},
-            response_url=URL(f"https://{domain}{cookie_path}"),
+        pairs = (
+            (_QM_CLIENT_ID, _QM_SECRET),
+            (_QM_PRIOR_CLIENT_ID, _QM_PRIOR_SECRET),
         )
+        for index, (qm_client_id, qm_secret) in enumerate(pairs, start=1):
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "Accept-Charset": "utf-8",
+                "User-Agent": _VW_USER_AGENT,
+                "x-qmauth": _x_qmauth(qm_client_id, qm_secret),
+            }
+            _LOGGER.debug(
+                "POST %s (authorization_code exchange, x-qmauth pair %s)",
+                _CARIAD_TOKEN_URL,
+                index,
+            )
+            async with session.post(
+                _CARIAD_TOKEN_URL,
+                headers=headers,
+                data=payload,
+                allow_redirects=False,
+            ) as response:
+                body = await response.text()
+                _LOGGER.debug("CARIAD token exchange: HTTP %s", response.status)
+                if response.status == 200:
+                    try:
+                        result = json.loads(body)
+                    except json.JSONDecodeError as error:
+                        raise LoginError(
+                            "CARIAD token endpoint returned invalid JSON"
+                        ) from error
+                    _LOGGER.debug(
+                        "CARIAD token exchange keys: %s", sorted(result.keys())
+                    )
+                    return result
+
+                # Body contains useful OAuth diagnostics but no credentials; log
+                # only a bounded representation.
+                _LOGGER.warning(
+                    "CARIAD token exchange failed (HTTP %s, pair %s): %s",
+                    response.status,
+                    index,
+                    body[:500],
+                )
+
+        return None
+
+    async def _maybe_dump(self, stage: str, html: str, url: str) -> None:
+        if self._html_debug_dir is not None and html:
+            await dump_html_debug(stage, html, self._html_debug_dir, url)
+
+
+def _extract_state(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    element = soup.select_one('input[name="state"]')
+    if element and element.get("value"):
+        return str(element["value"])
+    return None
+
+
+def _raise_login_page_error(html: str, status: int) -> None:
+    soup = BeautifulSoup(html, "html.parser")
+    for field_id in ("error-element-username", "error-element-password"):
+        span = soup.select_one(f'span[id="{field_id}"]')
+        if span and span.get("data-error-code") == "wrong-email-credentials":
+            raise LoginCredentialsError("Incorrect username or password")
+    raise LoginError(f"VW credential submission failed with HTTP {status}")
+
+
+def _looks_like_terms_page(html: str) -> bool:
+    lowered = html.lower()
+    return "termsandconditions" in lowered or "dataprivacy" in lowered
+
+
+async def _load_cookies(jar: aiohttp.CookieJar, file_path: Path) -> None:
+    try:
+        raw = await _read_text(file_path)
+        if not raw:
+            return
+        entries = json.loads(raw)
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            value = entry.get("value")
+            domain = entry.get("domain", "identity.vwgroup.io")
+            if name and value:
+                jar.update_cookies(
+                    {str(name): str(value)},
+                    response_url=URL.build(
+                        scheme="https",
+                        host=str(domain).lstrip("."),
+                    ),
+                )
+    except (OSError, json.JSONDecodeError, ValueError):
+        _LOGGER.debug("Could not load persisted VW auth cookies", exc_info=True)
+
+
+async def _save_cookies(jar: aiohttp.CookieJar, file_path: Path) -> None:
+    entries: list[dict[str, str]] = []
+    for cookie in jar:
+        entries.append(
+            {
+                "name": cookie.key,
+                "value": cookie.value,
+                "domain": cookie["domain"] or "identity.vwgroup.io",
+            }
+        )
+    try:
+        await _write_text(
+            file_path,
+            json.dumps(entries, indent=2),
+        )
+    except OSError:
+        _LOGGER.warning("Could not persist VW auth cookies", exc_info=True)
+
+
+async def _read_text(path: Path) -> str:
+    import asyncio
+
+    try:
+        return await asyncio.to_thread(path.read_text, encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+async def _write_text(path: Path, content: str) -> None:
+    import asyncio
+
+    await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+    await asyncio.to_thread(path.write_text, content, encoding="utf-8")
