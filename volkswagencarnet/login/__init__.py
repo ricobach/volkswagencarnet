@@ -1,5 +1,5 @@
-"""Device authorization flow login for volkswagencarnet."""
+"""Volkswagen authentication flows for volkswagencarnet."""
 
-from .flow import VWLoginFlow
+from .pkce import VWLoginFlow
 
 __all__ = ["VWLoginFlow"]
