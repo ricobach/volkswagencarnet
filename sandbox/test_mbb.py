@@ -2,9 +2,14 @@
 """End-to-end Volkswagen EU legacy MBB/Car-Net authentication probe.
 
 This deliberately runs as a sandbox probe before the MBB path is wired into
-Connection.  It uses RFC 8628 device authorization, asks the user to approve
+Connection. It uses RFC 8628 device authorization, asks the user to approve
 the login in Volkswagen's browser page, exchanges the resulting VW ID token
-for a legacy MBB bearer, and finally probes garage enumeration.
+for a legacy MBB bearer, then probes both account-level garage enumeration and
+VIN-scoped MBB permission/discovery endpoints.
+
+Account-level garage enumeration is expected to return HTTP 403 for the
+``sc2:fal`` MBB bearer. Set ``VW_VIN`` in sandbox/.env to test the vehicle-level
+path instead.
 
 Tokens are never printed.
 """
@@ -14,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import time
 from typing import Any
 
@@ -38,6 +44,9 @@ APP_NAME = "WeConnect"
 APP_VERSION = "5.17.6"
 REGISTER_UA = f"WeConnect/{APP_VERSION} (Android 14; okhttp/3.14.9)"
 TOKEN_UA = "okhttp/3.14.9"
+
+MAL_LEGACY = "https://mal-1a.prd.ece.vwg-connect.com"
+MAL_MODERN = "https://mal-3a.prd.eu.dp.vwg-connect.com"
 
 
 def _jwt_claims(token: str) -> dict[str, Any]:
@@ -66,6 +75,21 @@ def _mbb_audience(id_token: str) -> str | None:
     return None
 
 
+def _headers(bearer: str, client_id: str) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {bearer}",
+        "Accept": "application/json",
+        "X-App-Name": "Volkswagen",
+        "X-App-Version": "3.51.1",
+        "User-Agent": TOKEN_UA,
+        "X-Client-Id": client_id,
+    }
+    user_id = str(_jwt_claims(bearer).get("sub") or "")
+    if user_id:
+        headers["X-MbbUserId"] = user_id
+    return headers
+
+
 async def request_device_code(session: aiohttp.ClientSession) -> tuple[str, dict]:
     last_error = ""
     for client_id in MBB_DEVICE_CLIENTS:
@@ -83,9 +107,7 @@ async def request_device_code(session: aiohttp.ClientSession) -> tuple[str, dict
                 print(f"Device authorization OK using client {client_id.split('@')[0]}")
                 return client_id, payload
             last_error = f"HTTP {response.status}: {body[:250]}"
-            print(
-                f"Device client {client_id.split('@')[0]} rejected: {last_error}"
-            )
+            print(f"Device client {client_id.split('@')[0]} rejected: {last_error}")
     raise RuntimeError(f"No MBB device client was accepted: {last_error}")
 
 
@@ -225,50 +247,111 @@ async def probe_garage(
     client_id: str,
 ) -> None:
     claims = _jwt_claims(bearer)
-    user_id = str(claims.get("sub") or "")
     print(
         "MBB bearer metadata: "
-        f"sys={claims.get('sys')} cor={claims.get('cor')} sub_present={bool(user_id)}"
+        f"sys={claims.get('sys')} cor={claims.get('cor')} "
+        f"sub_present={bool(claims.get('sub'))}"
     )
 
-    headers = {
-        "Authorization": f"Bearer {bearer}",
-        "Accept": "application/json",
-        "X-App-Name": "Volkswagen",
-        "X-App-Version": "3.51.1",
-        "User-Agent": TOKEN_UA,
-        "X-Client-Id": client_id,
-    }
-    if user_id:
-        headers["X-MbbUserId"] = user_id
-
+    headers = _headers(bearer, client_id)
     candidates = (
         "https://msg.volkswagen.de/fs-car/usermanagement/users/v1/VW/DK/vehicles",
         "https://msg.volkswagen.de/fs-car/usermanagement/users/v1/VW/DE/vehicles",
-        "https://mal-1a.prd.ece.vwg-connect.com/api/usermanagement/users/v1/vehicles",
+        f"{MAL_LEGACY}/api/usermanagement/users/v1/vehicles",
     )
 
+    got_200 = False
     for url in candidates:
         try:
             async with session.get(url, headers=headers) as response:
                 text = await response.text()
                 print(f"Garage probe {url}: HTTP {response.status}")
                 if response.status == 200:
+                    got_200 = True
                     try:
                         payload = json.loads(text)
                     except ValueError:
                         payload = None
                     print("Garage response:")
                     print(json.dumps(payload, indent=2)[:4000] if payload else text[:4000])
-                    return
-                print(text[:500])
+                else:
+                    print(text[:500])
         except Exception as exc:
             print(f"Garage probe {url}: connection error: {exc}")
 
-    raise RuntimeError("No MBB garage enumeration endpoint returned HTTP 200")
+    if not got_200:
+        print(
+            "Garage enumeration was denied. This is expected for the "
+            "sc2:fal MBB bearer; continuing with VW_VIN if configured."
+        )
+
+
+async def _probe_url(
+    session: aiohttp.ClientSession,
+    label: str,
+    url: str,
+    headers: dict[str, str],
+) -> tuple[int, str]:
+    try:
+        async with session.get(url, headers=headers) as response:
+            text = await response.text()
+            print(f"{label}: HTTP {response.status}")
+            print(text[:2000])
+            return response.status, text
+    except Exception as exc:
+        print(f"{label}: connection error: {exc}")
+        return 0, str(exc)
+
+
+async def probe_vehicle(
+    session: aiohttp.ClientSession,
+    bearer: str,
+    client_id: str,
+    vin: str,
+    country: str,
+) -> bool:
+    vin = vin.strip().upper()
+    if len(vin) != 17:
+        raise RuntimeError("VW_VIN must be a 17-character VIN")
+
+    headers = _headers(bearer, client_id)
+    print(f"\nTesting VIN-scoped MBB access for {vin[:3]}...{vin[-4:]}")
+
+    probes: list[tuple[str, str]] = [
+        (
+            "homeRegion",
+            f"{MAL_LEGACY}/api/cs/vds/v1/vehicles/{vin}/homeRegion",
+        ),
+        (
+            "operationList/v3",
+            f"{MAL_LEGACY}/api/rolesrights/operationlist/v3/vehicles/{vin}",
+        ),
+    ]
+
+    countries = [country.upper()]
+    if "DE" not in countries:
+        countries.append("DE")
+    for cc in countries:
+        probes.append(
+            (
+                f"fetched-role ({cc})",
+                f"{MAL_MODERN}/api/rolesrights/permissions/v1/VW/{cc}/vehicles/{vin}/fetched-role",
+            )
+        )
+
+    any_success = False
+    for label, url in probes:
+        status, _ = await _probe_url(session, label, url, headers)
+        if status == 200:
+            any_success = True
+
+    return any_success
 
 
 async def main() -> int:
+    vin = os.getenv("VW_VIN", "").strip().upper()
+    country = os.getenv("VW_COUNTRY", "DK").strip().upper() or "DK"
+
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         client_id, device = await request_device_code(session)
@@ -287,13 +370,31 @@ async def main() -> int:
         id_token = str(idp_tokens["id_token"])
         registered_client_id = await register_mbb(session, id_token)
         mbb_tokens = await exchange_mbb(session, id_token, registered_client_id)
-        await probe_garage(
+        bearer = str(mbb_tokens["access_token"])
+
+        await probe_garage(session, bearer, registered_client_id)
+
+        if not vin:
+            print(
+                "\nMBB authentication is OK, but VW_VIN is not configured. "
+                "Add VW_VIN=<17-character VIN> to sandbox/.env and rerun to "
+                "test vehicle-level access."
+            )
+            return 2
+
+        vehicle_ok = await probe_vehicle(
             session,
-            str(mbb_tokens["access_token"]),
+            bearer,
             registered_client_id,
+            vin,
+            country,
         )
 
-    print("\nMBB END-TO-END PROBE OK")
+    if not vehicle_ok:
+        print("\nMBB AUTH OK, BUT NO VIN-SCOPED ENDPOINT RETURNED HTTP 200")
+        return 1
+
+    print("\nMBB END-TO-END VEHICLE PROBE OK")
     return 0
 
 
