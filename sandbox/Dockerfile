@@ -2,7 +2,8 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/workspace
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
@@ -10,11 +11,13 @@ RUN apt-get update \
 
 WORKDIR /build
 
-COPY requirements.txt setup.cfg pyproject.toml README.md ./
-COPY volkswagencarnet ./volkswagencarnet
+COPY requirements.txt ./
 
+# Install only third-party dependencies into the image. The actual
+# volkswagencarnet source is bind-mounted at /workspace by Compose, so Python
+# code changes are picked up immediately without rebuilding the image.
 RUN python -m pip install --upgrade pip \
-    && python -m pip install --no-cache-dir -e .
+    && python -m pip install --no-cache-dir -r requirements.txt
 
 WORKDIR /workspace
 
